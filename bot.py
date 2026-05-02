@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)s %(name)s: %(message)s',
@@ -34,7 +34,8 @@ SEARCH_COOLDOWN_SECONDS = 5
 SECTION_LINE_PATTERN = re.compile(r'^\[[^\[\]]+\]$')
 LANGUAGE_MODES = {'original', 'ru', 'en', 'any'}
 ADMIN_CALLBACK_HISTORY = 'admin_history_txt'
-ADMIN_CALLBACK_TODO = 'admin_todo_stub'
+ADMIN_CALLBACK_SHUTDOWN = 'admin_shutdown'
+ADMIN_CALLBACK_BROADCAST = 'admin_broadcast'
 
 
 def ensure_history_file():
@@ -78,6 +79,20 @@ def is_admin_user(user):
     return user.id in admin_ids
 
 
+def get_all_user_ids():
+    ensure_history_file()
+    user_ids = set()
+
+    with HISTORY_PATH.open('r', encoding='utf-8') as csv_file:
+        reader = csv.DictReader(csv_file, delimiter=';')
+        for row in reader:
+            user_id_str = row.get('ID пользователя', '').strip()
+            if user_id_str and user_id_str.isdigit():
+                user_ids.add(int(user_id_str))
+
+    return user_ids
+
+
 def build_history_txt():
     ensure_history_file()
     content = HISTORY_PATH.read_text(encoding='utf-8')
@@ -91,10 +106,11 @@ async def admin(update, context):
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton('История (txt)', callback_data=ADMIN_CALLBACK_HISTORY)],
-            [InlineKeyboardButton('Скоро (заглушка)', callback_data=ADMIN_CALLBACK_TODO)],
+            [InlineKeyboardButton('Рассылка всем', callback_data=ADMIN_CALLBACK_BROADCAST)],
+            [InlineKeyboardButton('Остановить бота', callback_data=ADMIN_CALLBACK_SHUTDOWN)],
         ]
     )
-    await update.message.reply_text('Админ панель', reply_markup=keyboard)
+    await update.message.reply_text('Админка', reply_markup=keyboard)
 
 
 async def admin_callback(update, context):
@@ -106,8 +122,32 @@ async def admin_callback(update, context):
     if not is_admin_user(query.from_user):
         return
 
-    if query.data == ADMIN_CALLBACK_TODO:
-        await query.message.reply_text('Потом сделаю')
+    if query.data == ADMIN_CALLBACK_BROADCAST:
+        context.user_data['awaiting_broadcast'] = True
+        await query.message.reply_text(
+            'Отправь сообщение, которое нужно разослать всем пользователям.\n'
+            'Отправь /cancel для отмены.'
+        )
+        return
+
+    if query.data == ADMIN_CALLBACK_SHUTDOWN:
+        user_ids = get_all_user_ids()
+        sent_count = 0
+        failed_users = []
+
+        for user_id in user_ids:
+            try:
+                await context.bot.send_message(chat_id=user_id, text='Бот оффлайн.')
+                sent_count += 1
+            except Exception as e:
+                logger.warning('Failed to send shutdown message to user_id=%s: %s', user_id, e)
+                failed_users.append((user_id, str(e)))
+
+        response = f'Bot has been shut down.\n' + format_broadcast_response(sent_count, failed_users, len(user_ids))
+        await query.message.reply_text(response)
+        logger.info('Shutdown requested by admin user_id=%s', query.from_user.id)
+        await context.application.stop()
+        await context.application.shutdown()
         return
 
     if query.data != ADMIN_CALLBACK_HISTORY:
@@ -461,6 +501,28 @@ def check_and_update_cooldown(
     return max(1, int(cooldown_seconds - elapsed))
 
 
+def format_broadcast_response(sent_count, failed_users, total_users):
+    response = (
+        f'Рассылка завершена.\n'
+        f'Отправлено: {sent_count}\n'
+        f'Не удалось: {len(failed_users)}\n'
+        f'Всего пользователей: {total_users}'
+    )
+
+    if failed_users:
+        response += '\n\nНе удалось отправить:\n'
+        for idx, (user_id, error) in enumerate(failed_users):
+            error_short = error[:100] + '...' if len(error) > 100 else error
+            line = f'• ID {user_id}: {error_short}\n'
+            if len(response) + len(line) > TELEGRAM_MESSAGE_LIMIT - 100:
+                remaining = len(failed_users) - idx
+                response += f'... и ещё {remaining} пользователей'
+                break
+            response += line
+
+    return response
+
+
 async def start(update, context):
     await update.message.reply_text(
         'Привет! Я бот для поиска текстов песен. Для начала обязательно прочти /help')
@@ -469,9 +531,9 @@ async def start(update, context):
 async def help_command(update, context):
     await update.message.reply_text(
         'Команды:\n'
-        '/start — приветствие\n'
-        '/help — показать справку\n'
-        '/search [original|ru|en|any] <Исполнитель> <Название> — найти текст песни\n\n'
+        '/start - приветствие\n'
+        '/help - показать справку\n'
+        '/search [original|ru|en|any] <Исполнитель> <Название> — найти текст песни\n'
         'Пояснение:\n'
         'регистр слов неважен\n'
         'можно указать только название трека\n'
@@ -519,6 +581,12 @@ def is_valid_search_query(query):
 
 
 async def search(update, context):
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    if context.user_data.get('awaiting_broadcast'):
+        return
+
     if not context.args:
         await update.message.reply_text(
             'Укажи исполнителя и название песни.\n'
@@ -539,8 +607,6 @@ async def search(update, context):
         )
         return
 
-    user = update.effective_user
-    user_id = user.id if user else 0
     username = f'@{user.username}' if user and user.username else '-'
     cooldown_map = context.application.bot_data.setdefault('last_search_at', {})
     wait_seconds = check_and_update_cooldown(user_id, cooldown_map)
@@ -590,6 +656,129 @@ async def on_error(update, context):
         await update.effective_message.reply_text('Временная ошибка, попробуйте еще раз.')
 
 
+async def cancel(update, context):
+    if not is_admin_user(update.effective_user):
+        return
+
+    if context.user_data.get('awaiting_broadcast'):
+        context.user_data['awaiting_broadcast'] = False
+        await update.message.reply_text('Рассылка отменена.')
+    else:
+        await update.message.reply_text('Нечего отменять.')
+
+
+async def shutdown_command(update, context):
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text('У вас нет прав для этой команды.')
+        return
+
+    user_ids = get_all_user_ids()
+    sent_count = 0
+    failed_users = []
+
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text='Бот оффлайн.')
+            sent_count += 1
+        except Exception as e:
+            logger.warning('Failed to send shutdown message to user_id=%s: %s', user_id, e)
+            failed_users.append((user_id, str(e)))
+
+    response = f'Bot has been shut down.\nУведомлено пользователей: {sent_count}/{len(user_ids)}'
+
+    if failed_users:
+        response += '\n\nНе удалось отправить:\n'
+        for user_id, error in failed_users:
+            response += f'• ID {user_id}: {error}\n'
+
+    await update.message.reply_text(response)
+    logger.info('Shutdown requested by admin user_id=%s', update.effective_user.id)
+    await context.application.stop()
+    await context.application.shutdown()
+
+
+async def messageall_command(update, context):
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text('У вас нет прав для этой команды.')
+        return
+
+    if not context.args:
+        await update.message.reply_text('Укажи текст сообщения.\nПример: /messageall Бот будет недоступен 2 часа')
+        return
+
+    broadcast_text = ' '.join(context.args)
+    if not broadcast_text.strip():
+        await update.message.reply_text('Сообщение пустое.')
+        return
+
+    user_ids = get_all_user_ids()
+    sent_count = 0
+    failed_users = []
+
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=broadcast_text)
+            sent_count += 1
+        except Exception as e:
+            logger.warning('Failed to send broadcast to user_id=%s: %s', user_id, e)
+            failed_users.append((user_id, str(e)))
+
+    response = (
+        f'Рассылка завершена.\n'
+        f'Отправлено: {sent_count}\n'
+        f'Не удалось: {len(failed_users)}\n'
+        f'Всего пользователей: {len(user_ids)}'
+    )
+
+    if failed_users:
+        response += '\n\nНе удалось отправить:\n'
+        for user_id, error in failed_users:
+            response += f'• ID {user_id}: {error}\n'
+
+    await update.message.reply_text(response)
+
+
+async def handle_broadcast_message(update, context):
+    if not is_admin_user(update.effective_user):
+        return
+
+    if not context.user_data.get('awaiting_broadcast'):
+        return
+
+    context.user_data['awaiting_broadcast'] = False
+    broadcast_text = update.message.text
+
+    if not broadcast_text or not broadcast_text.strip():
+        await update.message.reply_text('Сообщение пустое. Рассылка отменена.')
+        return
+
+    user_ids = get_all_user_ids()
+    sent_count = 0
+    failed_users = []
+
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=broadcast_text)
+            sent_count += 1
+        except Exception as e:
+            logger.warning('Failed to send broadcast to user_id=%s: %s', user_id, e)
+            failed_users.append((user_id, str(e)))
+
+    response = (
+        f'Рассылка завершена.\n'
+        f'Отправлено: {sent_count}\n'
+        f'Не удалось: {len(failed_users)}\n'
+        f'Всего пользователей: {len(user_ids)}'
+    )
+
+    if failed_users:
+        response += '\n\nНе удалось отправить:\n'
+        for user_id, error in failed_users:
+            response += f'• ID {user_id}: {error}\n'
+
+    await update.message.reply_text(response)
+
+
 def main():
     load_dotenv()
     bot_token = os.getenv('BOT_TOKEN')
@@ -603,8 +792,14 @@ def main():
     app.add_handler(CommandHandler('status', status))
     app.add_handler(CommandHandler('search', search))
     app.add_handler(CommandHandler('admin', admin))
+    app.add_handler(CommandHandler('cancel', cancel))
+    app.add_handler(CommandHandler('shutdown', shutdown_command))
+    app.add_handler(CommandHandler('messageall', messageall_command))
     app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_message))
     app.add_error_handler(on_error)
+
+    logger.info('Бот запущен и готов к работе')
     app.run_polling()
 
 
